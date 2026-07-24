@@ -1,26 +1,53 @@
 import csv
 import json
+import os
+import ssl
 import urllib.request
 import urllib.parse
 import base64
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from flask import Flask, render_template_string
 import yfinance as yf
 
+# =====================================================================
+# 0. SSL & CA BUNDLE CONFIGURATION
+# =====================================================================
+# Set custom CA bundle path from environment variable or hardcoded fallback
+CUSTOM_CA_PATH = os.environ.get("CUSTOM_CA_PATH", "/path/to/your/ca-bundle.crt")
+
+# Set standard environment variables so requests/yfinance inherit the CA bundle
+if os.path.exists(CUSTOM_CA_PATH):
+    os.environ["SSL_CERT_FILE"] = CUSTOM_CA_PATH
+    os.environ["REQUESTS_CA_BUNDLE"] = CUSTOM_CA_PATH
+    os.environ["CURL_CA_BUNDLE"] = CUSTOM_CA_PATH
+
+def get_ssl_context():
+    #SSL Context using custom CA bundle if available, else defaults.
+    cert_path = os.environ.get("SSL_CERT_FILE")
+    if cert_path and os.path.exists(cert_path):
+        return ssl.create_default_context(cafile=cert_path)
+    return ssl.create_default_context()
+
+#Global config
 app = Flask(__name__)
+HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
 
 # =====================================================================
 # 1. CORE INTELLIGENCE LOGIC
 # =====================================================================
+
+@lru_cache(maxsize=1)
 def fetch_cisa_kev_database():
     cisa_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        req = urllib.request.Request(cisa_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read())
-    except Exception:
+        req = urllib.request.Request(cisa_url, headers=HTTP_HEADERS)
+        with urllib.request.urlopen(req, context=get_ssl_context(), timeout=10) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"[!] Error fetching CISA KEV DB: {e}")
         return None
 
 def extract_real_news_url(google_news_url):
@@ -31,14 +58,15 @@ def extract_real_news_url(google_news_url):
             if padding:
                 encoded_part += "=" * (4 - padding)
             
-            decoded_bytes = base64.b64decode(encoded_part)
+            decoded_bytes = base64.urlsafe_b64decode(encoded_part)
             decoded_str = decoded_bytes.decode('utf-8', errors='ignore')
             
             if "http" in decoded_str:
                 start_idx = decoded_str.find("http")
                 clean_url = ""
+                valid_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%"
                 for char in decoded_str[start_idx:]:
-                    if char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%":
+                    if char in valid_chars:
                         clean_url += char
                     else:
                         break
@@ -55,10 +83,9 @@ def fetch_vendor_news_alerts(vendor_name):
     rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(search_query)}&hl=en-US&gl=US&ceid=US:en"
     
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        req = urllib.request.Request(rss_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as response:
-            root = ET.fromstring(response.read())
+        req = urllib.request.Request(rss_url, headers=HTTP_HEADERS)
+        with urllib.request.urlopen(req, context=get_ssl_context(), timeout=8) as response:
+            root = ET.fromstring(response.read().decode('utf-8'))
         
         for item in root.findall(".//item"):
             title = item.find("title").text if item.find("title") is not None else "Unknown Title"
@@ -76,8 +103,8 @@ def fetch_vendor_news_alerts(vendor_name):
                     break
                     
             return {"title": title, "link": link, "date": pub_date, "keyword": matched_keyword}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] Error fetching RSS for {vendor_name}: {e}")
     return None
 
 def calculate_vendor_score(vendor, cisa_db):
@@ -89,8 +116,9 @@ def calculate_vendor_score(vendor, cisa_db):
         
     one_year_ago = datetime.now() - timedelta(days=365)
     
-    for vuln in cisa_db["vulnerabilities"]:
-        if vendor_name in vuln.get("vendorProject", "").lower():
+    for vuln in cisa_db.get("vulnerabilities", []):
+        vendor_project = vuln.get("vendorProject", "").lower()
+        if vendor_name in vendor_project:
             date_added_str = vuln.get("dateAdded", "")
             try:
                 date_added = datetime.strptime(date_added_str, "%Y-%m-%d")
@@ -116,27 +144,27 @@ def fetch_stock_impact(ticker, cve_date_str):
         stock = yf.Ticker(ticker)
         cve_date = datetime.strptime(cve_date_str, "%Y-%m-%d")
         
-        # Look back 5 days to account for weekends/market closures
         start_date = cve_date - timedelta(days=5)
         end_date = cve_date + timedelta(days=7)
         
         hist_then = stock.history(start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
         hist_today = stock.history(period="1d")
         
-        if not hist_then.empty and not hist_today.empty:
+        if not hist_then.empty and not hist_today.empty and len(hist_then["Close"]) > 0:
             price_then = float(hist_then["Close"].iloc[0])
             price_today = float(hist_today["Close"].iloc[-1])
-            pct_change = ((price_today - price_then) / price_then) * 100
             
-            return {
-                "ticker": ticker.upper(),
-                "cve_date": cve_date_str,
-                "price_then": round(price_then, 2),
-                "price_today": round(price_today, 2),
-                "change_pct": round(pct_change, 2)
-            }
-    except Exception:
-        pass
+            if price_then > 0:
+                pct_change = ((price_today - price_then) / price_then) * 100
+                return {
+                    "ticker": ticker.upper(),
+                    "cve_date": cve_date_str,
+                    "price_then": round(price_then, 2),
+                    "price_today": round(price_today, 2),
+                    "change_pct": round(pct_change, 2)
+                }
+    except Exception as e:
+        print(f"[!] Stock fetch failed for {ticker}: {e}")
     return None
 
 def load_vendor_portfolio(filepath="vendors.csv"):
@@ -147,17 +175,23 @@ def load_vendor_portfolio(filepath="vendors.csv"):
             for row in reader:
                 portfolio.append({
                     "name": row["name"].strip(),
-                    "previous_score": int(row["previous_score"]),
-                    "business_criticality": row["business_criticality"].strip(),
+                    "previous_score": int(row.get("previous_score", 0)),
+                    "business_criticality": row.get("business_criticality", "Low").strip(),
                     "ticker": row.get("ticker", "N/A").strip(),
                     "active_cisa_vulnerabilities": []
                 })
         return portfolio
     except FileNotFoundError:
-        return []
+        print(f"[!] '{filepath}' not found. Loading fallback portfolio.")
+        return [
+            {"name": "Microsoft", "previous_score": 20, "business_criticality": "CRITICAL", "ticker": "MSFT", "active_cisa_vulnerabilities": []},
+            {"name": "Cisco", "previous_score": 10, "business_criticality": "HIGH", "ticker": "CSCO", "active_cisa_vulnerabilities": []},
+            {"name": "Slack", "previous_score": 0, "business_criticality": "MEDIUM", "ticker": "WORK", "active_cisa_vulnerabilities": []}
+        ]
+
 
 # =====================================================================
-# 2. SIDEBAR DASHBOARD HTML TEMPLATE
+# 2. DASHBOARD HTML TEMPLATE
 # =====================================================================
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -169,11 +203,9 @@ HTML_PAGE = """
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f6f9; margin: 0; padding: 15px; color: #333; }
         .header { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 12px 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 12px; }
         
-        /* Main Layout Grid */
         .dashboard-container { display: flex; gap: 10px; align-items: stretch; }
         .main-stage { flex: 1; min-width: 0; }
         
-        /* Dedicated Visible Vertical Divider Bar */
         .divider {
             width: 3px;
             background-color: #cbd5e1;
@@ -196,12 +228,10 @@ HTML_PAGE = """
         .section-title.high { color: #d32f2f; }
         .section-title.low { color: #2e7d32; }
 
-        /* Row Container - Visible limit set to ~3 cards */
         .card-row { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 12px; max-width: 100%; }
         .card-row::-webkit-scrollbar { height: 6px; }
         .card-row::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
 
-        /* Fixed Width Card */
         .card { flex: 0 0 280px; height: 250px; background: #fff; padding: 12px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-top: 4px solid #ccc; display: flex; flex-direction: column; justify-content: space-between; box-sizing: border-box; }
         .card.CRITICAL { border-top-color: #e74c3c; }
         .card.MEDIUM { border-top-color: #f39c12; }
@@ -225,7 +255,6 @@ HTML_PAGE = """
         .field-group { margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px dashed #e0e0e0; }
         .field-group:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
 
-        /* Sidebar Item Styling */
         .sidebar-title { font-size: 0.9em; font-weight: bold; margin: 0 0 10px 0; padding-bottom: 6px; border-bottom: 2px solid #333; display: flex; align-items: center; gap: 6px; }
         .stock-card { background: #f8f9fa; border: 1px solid #e9ecef; padding: 10px; border-radius: 6px; margin-bottom: 10px; font-size: 0.8em; }
         .stock-header { display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 4px; }
@@ -405,7 +434,6 @@ def dashboard():
             vendor["current_score"] = calculate_vendor_score(vendor, live_kev_database)
             vendor["latest_news_alert"] = fetch_vendor_news_alerts(vendor["name"])
             
-            # Fetch stock impact if critical/medium and has active vulnerabilities
             if vendor["current_score"] >= 50 and vendor["active_cisa_vulnerabilities"]:
                 cve_date = vendor["active_cisa_vulnerabilities"][0]["date_added"]
                 vendor["stock_data"] = fetch_stock_impact(vendor["ticker"], cve_date)
