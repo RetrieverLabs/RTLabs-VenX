@@ -1,0 +1,8 @@
+name,previous_score,business_criticality,ticker
+Microsoft,100,Tier-1,MSFT
+Okta,0,Tier-1,N/A
+Fortinet,100,Tier-1,FTNT
+Cisco,100,Tier-2,CSCO
+CrowdStrike,0,Tier-1,CRWD
+GitHub,0,Tier-2,N/A
+Atlassian,0,Tier-2,TEAM
